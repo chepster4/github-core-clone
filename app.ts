@@ -16,11 +16,21 @@ export function shopToken(): string {
   return process.env.MAKEFUN_SHOP_TOKEN ?? '';
 }
 
+/**
+ * The expected `Authorization` header value, computed once: the token is fixed for
+ * the process, so rebuilding `Bearer ${token}` on every request is pure allocation.
+ * Empty means no token was set (then nothing is authorized, exactly as before).
+ */
+let cachedAuth: string | null = null;
+
 /** True when the request carries the trial's bearer token. */
 export function isAuthorized(req: IncomingMessage): boolean {
-  const token = shopToken();
-  if (token === '') return false;
-  return req.headers.authorization === `Bearer ${token}`;
+  if (cachedAuth === null) {
+    const token = shopToken();
+    cachedAuth = token === '' ? '' : `Bearer ${token}`;
+  }
+  if (cachedAuth === '') return false;
+  return req.headers.authorization === cachedAuth;
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
@@ -48,14 +58,23 @@ export function createApp(): Server {
       }
 
       // Git smart HTTP: /{owner}/{repo}.git/info/refs, git-upload-pack, git-receive-pack.
-      const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
+      // The git pattern can only match a two-segment path ending in `.git`, so the
+      // API paths (all under /api/v3 or /api/graphql) and /mcp never match it and
+      // skip the regex; a git path never starts with those prefixes, so routing
+      // never changes. This skips one regex exec on every REST/GraphQL/MCP call.
+      // `isRest` is computed once here and reused below, instead of re-testing the
+      // same three prefixes in the REST branch.
+      const isRest = path === '/api/v3' || path === '/api/v3/' || path.startsWith('/api/v3/');
+      const gitMatch = isRest || path === '/api/graphql' || path === '/mcp'
+        ? null
+        : /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
       if (gitMatch !== null) {
         await handleGit(store, req, res, gitMatch[1] as string, gitMatch[2] as string, gitMatch[3] ?? '/', requestId);
         return;
       }
 
       // REST v3 under /api/v3 (the root answers 200 with the token's scopes).
-      if (path === '/api/v3' || path === '/api/v3/' || path.startsWith('/api/v3/')) {
+      if (isRest) {
         await handleRest(store, req, res, path, requestId);
         return;
       }
