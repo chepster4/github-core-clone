@@ -225,8 +225,31 @@ function parseFetchArgs(lines: readonly string[]): FetchArgs {
 
 /** Distances (in parent hops) from the nearest want, for commits reachable from `wants`. */
 function commitDistances(repo: Parameters<Store['listRefs']>[0], wants: readonly string[]): Map<string, number> {
+  // Memoized per repo: a want's ancestry never changes (objects are immutable and
+  // new commits only point at existing ones), and the clone workload asks for the
+  // same tip 50 times in a row. The cache lives on the repo's object map identity.
+  const memo = DISTANCE_CACHE.get(repo.objects);
+  const key = wants.join('\n');
+  const hit = memo?.get(key);
+  if (hit !== undefined) return hit;
+  const distances = commitDistancesUncached(repo, wants);
+  let perRepo = memo;
+  if (perRepo === undefined) {
+    perRepo = new Map<string, Map<string, number>>();
+    DISTANCE_CACHE.set(repo.objects, perRepo);
+  }
+  perRepo.set(key, distances);
+  return distances;
+}
+
+/** Commit distances, keyed by the repo's object map (one entry per distinct want set). */
+const DISTANCE_CACHE = new WeakMap<ReadonlyMap<string, GitObject>, Map<string, Map<string, number>>>();
+
+/** The uncached distance walk (see commitDistances). */
+function commitDistancesUncached(repo: Parameters<Store['listRefs']>[0], wants: readonly string[]): Map<string, number> {
   const distances = new Map<string, number>();
   const queue: Array<{ oid: string; dist: number }> = [];
+  let head = 0;
   const push = (oid: string, dist: number): void => {
     if (oid === ZERO_OID || distances.has(oid)) return;
     const object = repo.objects.get(oid);
@@ -242,8 +265,8 @@ function commitDistances(repo: Parameters<Store['listRefs']>[0], wants: readonly
     queue.push({ oid, dist });
   };
   for (const want of wants) push(want, 0);
-  while (queue.length > 0) {
-    const { oid, dist } = queue.shift() as { oid: string; dist: number };
+  while (head < queue.length) {
+    const { oid, dist } = queue[head++] as { oid: string; dist: number };
     const object = repo.objects.get(oid);
     if (object === undefined || object.type !== 'commit') continue;
     for (const parent of parseCommit(object.data).parents) push(parent, dist + 1);
@@ -396,7 +419,8 @@ function receivePack(store: Store, repo: Parameters<Store['listRefs']>[0], body:
   if (packBytes.length > 0) {
     try {
       const parsed = readPack(packBytes);
-      for (const object of parsed.objects.values()) store.putObject(repo, object.type, object.data);
+      // readPack already hashed every object: store by its known oid, no second SHA-1.
+      for (const [oid, object] of parsed.objects) store.putObjectKnown(repo, oid, object.type, object.data);
     } catch (err) {
       unpackDetail = (err instanceof Error ? err.message : String(err)).replace(/[\r\n]+/g, ' ').slice(0, 200);
     }

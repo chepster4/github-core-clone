@@ -20,6 +20,11 @@ const CODE_TYPE: Readonly<Record<number, GitObjectType>> = { 1: 'commit', 2: 'tr
 const HEX40 = /^[0-9a-f]{40}$/;
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 
+/** Parsed commits, keyed by the stored object bytes (objects are immutable once stored). */
+const COMMIT_CACHE = new WeakMap<Uint8Array, CommitView>();
+/** Parsed trees, keyed by the stored object bytes (objects are immutable once stored). */
+const TREE_CACHE = new WeakMap<Uint8Array, TreeEntry[]>();
+
 export function isObjectId(value: string): boolean {
   return HEX40.test(value);
 }
@@ -35,7 +40,8 @@ export function objectHeader(type: GitObjectType, size: number): Buffer {
 
 /** git's object id: SHA-1 over `<type> <size>\0` + the object's bytes. */
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
-  const body = Buffer.from(data);
+  // A Buffer is hashed in place; anything else is copied once (never twice).
+  const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const hash = createHash('sha1');
   hash.update(objectHeader(type, body.length));
   hash.update(body);
@@ -51,6 +57,15 @@ export interface TreeEntry {
 
 /** Parse a tree object into its entries, in the object's stored order. */
 export function parseTree(data: Uint8Array): TreeEntry[] {
+  const cached = TREE_CACHE.get(data);
+  if (cached !== undefined) return cached;
+  const entries = parseTreeUncached(data);
+  TREE_CACHE.set(data, entries);
+  return entries;
+}
+
+/** The uncached tree parse (see parseTree). */
+function parseTreeUncached(data: Uint8Array): TreeEntry[] {
   const buffer = Buffer.from(data);
   const entries: TreeEntry[] = [];
   let offset = 0;
@@ -100,6 +115,15 @@ export interface CommitView {
 
 /** Parse a commit object; refuses a malformed header layout. */
 export function parseCommit(data: Uint8Array): CommitView {
+  const cached = COMMIT_CACHE.get(data);
+  if (cached !== undefined) return cached;
+  const view = parseCommitUncached(data);
+  COMMIT_CACHE.set(data, view);
+  return view;
+}
+
+/** The uncached commit parse (see parseCommit). */
+function parseCommitUncached(data: Uint8Array): CommitView {
   const buffer = Buffer.from(data);
   const blank = buffer.indexOf('\n\n');
   const headerEnd = blank < 0 ? buffer.length : blank;
@@ -457,7 +481,9 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   for (const object of list) {
     const data = Buffer.from(object.data);
     parts.push(writePackObjectHeader(object.type, data.length));
-    parts.push(deflateSync(data));
+    // Level 1: the client only inflates and checks the pack checksum, so the
+    // fastest valid zlib stream wins over the smallest one.
+    parts.push(deflateSync(data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);

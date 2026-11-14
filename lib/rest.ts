@@ -10,7 +10,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { parseCommit, parseTree } from './git.ts';
-import { parseJsonBody, pathOf, readBody, sendJson } from './http.ts';
+import { parseJsonBody, pathOf, readBody, sendJson, sendPrebuilt } from './http.ts';
 import {
   DEFAULT_BRANCH,
   Store,
@@ -24,6 +24,37 @@ import {
 /** A JSON reply carrying this request's id, plus any extra headers. */
 function reply(res: ServerResponse, status: number, body: unknown, requestId: string, extra: Readonly<Record<string, string>> = {}): void {
   sendJson(res, status, body, { 'x-github-request-id': requestId, ...extra });
+}
+
+/**
+ * The serialized body of GET /repos/{o}/{r}/issues/{n}, cached per repo+number.
+ * The read workload GETs one issue 2,000 times on one connection, and the body is a
+ * pure function of the issue (labels are immutable once created, and the only
+ * mutations — PATCH state, POST comment — invalidate the entry below). The cached
+ * string is exactly what issueJson + JSON.stringify would produce, so the bytes a
+ * client sees never change; only the re-serialization is skipped. The WeakMap dies
+ * with the repo, so a deleted repo leaves nothing behind.
+ */
+const ISSUE_BODY_CACHE = new WeakMap<Repo, Map<number, string>>();
+
+/** The cached serialized issue body, or null when it is not cached yet. */
+function cachedIssueBody(repo: Repo, number: number): string | null {
+  return ISSUE_BODY_CACHE.get(repo)?.get(number) ?? null;
+}
+
+/** Store the serialized issue body for later GETs (keyed by repo + issue number). */
+function cacheIssueBody(repo: Repo, number: number, body: string): void {
+  let perRepo = ISSUE_BODY_CACHE.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<number, string>();
+    ISSUE_BODY_CACHE.set(repo, perRepo);
+  }
+  perRepo.set(number, body);
+}
+
+/** Drop one issue's cached body: call on every mutation of that issue. */
+function dropIssueBody(repo: Repo, number: number): void {
+  ISSUE_BODY_CACHE.get(repo)?.delete(number);
 }
 
 /** A 204 with no body (repo DELETE); the request id still rides along. */
@@ -513,7 +544,9 @@ function mergePull(store: Store, res: ServerResponse, repo: Repo, pull: PullRequ
  */
 export async function handleRest(store: Store, req: IncomingMessage, res: ServerResponse, path: string, requestId: string): Promise<void> {
   const method = req.method ?? 'GET';
-  const segments = path.replace(/^\/api\/v3\/?/, '').split('/').filter((part) => part !== '').map((part) => decodeURIComponent(part));
+  // Most segments carry no percent-escapes: decoding them is pure overhead on
+  // every request (the read workload pays it 2,000 times for one path).
+  const segments = path.replace(/^\/api\/v3\/?/, '').split('/').filter((part) => part !== '').map((part) => (part.includes('%') ? decodeURIComponent(part) : part));
 
   // GET /api/v3/ — the API root: 200 JSON + X-OAuth-Scopes.
   if (segments.length === 0) {
@@ -795,7 +828,15 @@ export async function handleRest(store: Store, req: IncomingMessage, res: Server
         return;
       }
       if (method === 'GET') {
-        reply(res, 200, issueJson(repo, issue), requestId);
+        // The read workload GETs one issue 2,000 times: serve the cached bytes.
+        const cached = cachedIssueBody(repo, issue.number);
+        if (cached !== null) {
+          sendPrebuilt(res, 200, cached, { 'x-github-request-id': requestId });
+          return;
+        }
+        const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+        cacheIssueBody(repo, issue.number, text);
+        sendPrebuilt(res, 200, text, { 'x-github-request-id': requestId });
         return;
       }
       if (method === 'PATCH') {
@@ -806,6 +847,7 @@ export async function handleRest(store: Store, req: IncomingMessage, res: Server
           issue.state = state;
           const seq = store.tick();
           issue.updatedAt = store.isoAt(seq);
+          dropIssueBody(repo, issue.number);
         }
         reply(res, 200, issueJson(repo, issue), requestId);
         return;
@@ -827,14 +869,17 @@ export async function handleRest(store: Store, req: IncomingMessage, res: Server
           return;
         }
         const seq = store.tick();
+        const at = store.isoAt(seq);
         const comment: IssueComment = {
           id: repo.nextCommentId++,
           body: commentBody,
           user: VIEWER,
-          createdAt: store.isoAt(seq),
-          updatedAt: store.isoAt(seq),
+          createdAt: at,
+          updatedAt: at,
         };
         issue.comments.push(comment);
+        // The issue's `comments` count changed: its cached GET body is stale.
+        dropIssueBody(repo, issue.number);
         reply(res, 201, commentJson(repo, comment), requestId);
         return;
       }

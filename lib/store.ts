@@ -187,6 +187,11 @@ export class Store {
     return oid;
   }
 
+  /** Store an object whose oid is already known (a pack read just hashed it): no second SHA-1. */
+  putObjectKnown(repo: Repo, oid: string, type: GitObjectType, data: Uint8Array): void {
+    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data: Buffer.from(data) });
+  }
+
   getObject(repo: Repo, oid: string): GitObject | undefined {
     return repo.objects.get(oid);
   }
@@ -232,8 +237,22 @@ export class Store {
   isAncestor(repo: Repo, ancestor: string, oid: string): boolean {
     if (ancestor === oid) return true;
     if (ancestor === ZERO_OID) return true;
-    const reachable = collectReachable([oid], this.lookup(repo), { allowMissing: true });
-    return reachable.has(ancestor);
+    // Walk parents from `oid` and stop the moment `ancestor` is seen: a
+    // fast-forward push's parent IS the old tip, so this is one commit parse
+    // instead of a walk over the whole history. Only a true non-ancestor
+    // walks the full reachable set, exactly as before.
+    const seen = new Set<string>();
+    const stack: string[] = [oid];
+    while (stack.length > 0) {
+      const current = stack.pop() as string;
+      if (current === ancestor) return true;
+      if (seen.has(current) || current === ZERO_OID) continue;
+      seen.add(current);
+      const object = repo.objects.get(current);
+      if (object === undefined || object.type !== 'commit') continue;
+      for (const parent of parseCommit(object.data).parents) stack.push(parent);
+    }
+    return false;
   }
 
   /** The merge base of two commits: the first common ancestor found walking both histories. */
@@ -241,10 +260,12 @@ export class Store {
     if (a === b) return a;
     const ancestorsOfA = collectReachable([a], this.lookup(repo), { allowMissing: true });
     // Walk b's ancestry breadth-first (parents before grandparents) for the nearest common one.
+    // An index pointer, not shift(): shifting a 200-long queue per step is quadratic.
     const queue: string[] = [b];
+    let head = 0;
     const seen = new Set<string>();
-    while (queue.length > 0) {
-      const oid = queue.shift() as string;
+    while (head < queue.length) {
+      const oid = queue[head++] as string;
       if (seen.has(oid)) continue;
       seen.add(oid);
       if (ancestorsOfA.has(oid)) return oid;
@@ -417,6 +438,7 @@ export class Store {
 
   createIssue(repo: Repo, fields: { title: string; body?: string; labels?: string[] }): Issue {
     const seq = this.tick();
+    const at = this.isoAt(seq);
     const issue: Issue = {
       number: repo.nextNumber++,
       title: fields.title,
@@ -425,8 +447,8 @@ export class Store {
       labels: [...(fields.labels ?? [])],
       user: VIEWER,
       comments: [],
-      createdAt: this.isoAt(seq),
-      updatedAt: this.isoAt(seq),
+      createdAt: at,
+      updatedAt: at,
       seq,
     };
     repo.issues.set(issue.number, issue);
@@ -438,6 +460,7 @@ export class Store {
     fields: { title: string; body?: string; head: string; base: string },
   ): PullRequest {
     const seq = this.tick();
+    const at = this.isoAt(seq);
     const pull: PullRequest = {
       number: repo.nextNumber++,
       title: fields.title,
@@ -451,8 +474,8 @@ export class Store {
       baseSha: this.branchTip(repo, fields.base),
       mergeCommitSha: null,
       user: VIEWER,
-      createdAt: this.isoAt(seq),
-      updatedAt: this.isoAt(seq),
+      createdAt: at,
+      updatedAt: at,
       seq,
     };
     pull.mergeable = this.computeMergeable(repo, pull);

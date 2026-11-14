@@ -17,6 +17,17 @@ export function sendJson(
   res.end(text);
 }
 
+/** Answer with an already-serialized JSON body (a cached reply): no re-serialization. */
+export function sendPrebuilt(
+  res: ServerResponse,
+  status: number,
+  text: string,
+  headers: Readonly<Record<string, string>> = {},
+): void {
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
+  res.end(text);
+}
+
 /** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
 export function pathOf(req: IncomingMessage): string {
   try {
@@ -30,7 +41,8 @@ export function pathOf(req: IncomingMessage): string {
 export function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+    // Stream chunks already arrive as Buffers; copying each one again only doubles the work.
+    req.on('data', (chunk: Buffer) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
