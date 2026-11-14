@@ -32,6 +32,18 @@ const RETRY_MAX_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** The bound server, so a stop signal can close it cleanly before the process exits. */
+let boundServer: ReturnType<typeof createApp> | null = null;
+
+/** Close the bound server (if any) and exit 0 when the harness stops this process. */
+function shutDown(signal: string): void {
+  process.stdout.write(`[entry] ${signal} received; closing the server\n`);
+  if (boundServer !== null) boundServer.close();
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutDown('SIGTERM'));
+process.on('SIGINT', () => shutDown('SIGINT'));
+
 /** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
 function retryDelay(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
@@ -79,6 +91,7 @@ async function waitForDone(): Promise<void> {
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
   const server = createApp();
+  boundServer = server;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => resolve());
@@ -91,6 +104,7 @@ async function main(): Promise<void> {
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
+  boundServer = null;
   server.close();
   process.stdout.write('[entry] done\n');
 }
