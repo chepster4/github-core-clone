@@ -51,6 +51,13 @@ const RECEIVE_CAPABILITIES = 'report-status side-band-64k delete-refs ofs-delta 
 /** One sideband data packet carries at most this many channel bytes (65516 - 1 band byte). */
 const SIDEBAND_MAX = 65515;
 
+/** Static pkt-line pieces, built once: the fetch prefix, the packfile marker and the
+ * flush packet never change, so no request rebuilds them. Buffers are only ever
+ * concatenated or sent, never mutated, so sharing one instance is safe. */
+const FLUSH_PACKET: Buffer = pktFlush();
+const FETCH_ACK_PREFIX: Buffer = Buffer.concat([pktLine('acknowledgments\n'), pktLine('NAK\n'), pktFlush()]);
+const PACKFILE_MARKER: Buffer = pktLine('packfile\n');
+
 /** A request is malformed when the pkt-line framing cannot be read at all. */
 class Malformed extends Error {}
 
@@ -115,12 +122,17 @@ function peelTag(repoObjects: ReadonlyMap<string, GitObject>, oid: string): stri
 
 // ------------------------------------------------------------ advertisements
 
-/** GET info/refs for upload-pack: preamble + `version 2` + capability lines. */
-function uploadPackAdvertisement(): Buffer {
+/** GET info/refs for upload-pack: preamble + `version 2` + capability lines. Built once:
+ * the advertisement never changes, so every probe gets the same bytes. */
+const UPLOAD_PACK_ADVERTISEMENT: Buffer = (() => {
   const parts: Buffer[] = [pktLine('# service=git-upload-pack\n'), pktFlush(), pktLine('version 2\n')];
   for (const [key, value] of V2_CAPABILITIES) parts.push(pktLine(`${key}=${value}\n`));
   parts.push(pktFlush());
   return Buffer.concat(parts);
+})();
+
+function uploadPackAdvertisement(): Buffer {
+  return UPLOAD_PACK_ADVERTISEMENT;
 }
 
 /**
@@ -130,7 +142,7 @@ function uploadPackAdvertisement(): Buffer {
  */
 function receivePackAdvertisement(store: Store, repo: Parameters<Store['listRefs']>[0]): Buffer {
   const refs = store.listRefs(repo);
-  const parts: Buffer[] = [pktLine('# service=git-receive-pack\n'), pktFlush()];
+  const parts: Buffer[] = [pktLine('# service=git-receive-pack\n'), FLUSH_PACKET];
   if (refs.length === 0) {
     parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${RECEIVE_CAPABILITIES}\n`));
   } else {
@@ -142,7 +154,7 @@ function receivePackAdvertisement(store: Store, repo: Parameters<Store['listRefs
       if (peeled !== null) parts.push(pktLine(`${peeled} ${ref}^{}\n`));
     }
   }
-  parts.push(pktFlush());
+  parts.push(FLUSH_PACKET);
   return Buffer.concat(parts);
 }
 
@@ -170,12 +182,11 @@ function parseLsRefsArgs(lines: readonly string[]): LsRefsArgs {
  * POST git-upload-pack `command=ls-refs`. Answers one line per ref (HEAD first when it
  * exists), honouring `peel` / `symrefs` / `unborn` / `ref-prefix` — the prefix filter is
  * applied server-side, because `git.ls-refs-prefix` judges the raw refs sent.
+ * `argsStart` is the offset of the arguments section: handleGit already read the
+ * command section to route here, so it is not parsed twice.
  */
-function lsRefs(store: Store, repo: Parameters<Store['listRefs']>[0], body: Buffer): Buffer {
-  const command = readSection(body, 0);
-  const commandText = textLines(command.lines);
-  if (commandText[0] !== 'command=ls-refs') throw new Malformed('expected command=ls-refs');
-  const argsLines = readSection(body, command.after).lines;
+function lsRefs(store: Store, repo: Parameters<Store['listRefs']>[0], body: Buffer, argsStart: number): Buffer {
+  const argsLines = readSection(body, argsStart).lines;
   const args = parseLsRefsArgs(textLines(argsLines));
   const matches = (name: string): boolean => args.prefixes.length === 0 || args.prefixes.some((prefix) => name.startsWith(prefix));
 
@@ -197,7 +208,7 @@ function lsRefs(store: Store, repo: Parameters<Store['listRefs']>[0], body: Buff
     }
     out.push(pktLine(`${line}\n`));
   }
-  out.push(pktFlush());
+  out.push(FLUSH_PACKET);
   return Buffer.concat(out);
 }
 
@@ -280,22 +291,28 @@ function commitDistancesUncached(repo: Parameters<Store['listRefs']>[0], wants: 
  * prefix of the wanted history, minus what the client already holds, and the boundary
  * commits (distance N-1, with parents cut off) are reported `shallow`, while old
  * boundaries whose parents are now included are reported `unshallow`.
+ *
+ * `objectOids` is the sorted oid list the objects were built from, in the same order:
+ * a pack is a pure function of that list (objects are immutable), so fetchV2 caches
+ * the built pack on it and the clone workload's 50 identical fetches pay the
+ * deflates once.
  */
 function fetchSelection(
   store: Store,
   repo: Parameters<Store['listRefs']>[0],
   args: FetchArgs,
-): { objects: GitObject[]; shallow: string[]; unshallow: string[] } {
+): { objects: GitObject[]; objectOids: string[]; shallow: string[]; unshallow: string[] } {
   if (args.depth === null) {
     const held = collectReachable(args.haves, store.lookup(repo), { allowMissing: true });
     const wanted = collectReachable(args.wants, store.lookup(repo), { allowMissing: true });
     const objects: GitObject[] = [];
+    const objectOids: string[] = [];
     for (const oid of [...wanted].sort()) {
       if (held.has(oid)) continue;
       const object = repo.objects.get(oid);
-      if (object !== undefined) objects.push(object);
+      if (object !== undefined) { objects.push(object); objectOids.push(oid); }
     }
-    return { objects, shallow: [], unshallow: [] };
+    return { objects, objectOids, shallow: [], unshallow: [] };
   }
 
   const depth = Math.max(1, args.depth);
@@ -323,10 +340,11 @@ function fetchSelection(
     if (object !== undefined && object.type === 'tag' && included.has(parseTag(object.data).object)) wanted.add(want);
   }
   const objects: GitObject[] = [];
+  const objectOids: string[] = [];
   for (const oid of [...wanted].sort()) {
     if (held.has(oid)) continue;
     const object = repo.objects.get(oid);
-    if (object !== undefined) objects.push(object);
+    if (object !== undefined) { objects.push(object); objectOids.push(oid); }
   }
   // Boundary: an included commit at distance depth-1 that still has a parent.
   const shallow: string[] = [];
@@ -343,34 +361,55 @@ function fetchSelection(
     const parents = parseCommit(object.data).parents;
     if (parents.length > 0 && parents.every((parent) => included.has(parent))) unshallow.push(boundary);
   }
-  return { objects, shallow: shallow.sort(), unshallow: unshallow.sort() };
+  return { objects, objectOids, shallow: shallow.sort(), unshallow: unshallow.sort() };
+}
+
+/** Packs already built, keyed by the sorted object ids they carry (see fetchSelection). */
+const PACK_CACHE = new Map<string, Buffer>();
+/** The most packs the cache holds; the oldest goes when a new one arrives past this. */
+const PACK_CACHE_MAX = 32;
+
+/**
+ * The pack for `objects`, from the cache when the same oid list was built before.
+ * A pack is a pure function of its object list, so a hit is byte-identical to a
+ * rebuild; the clone workload's 50 identical depth-1 fetches build once and hit 49
+ * times, skipping every deflate, the SHA-1 and the concats.
+ */
+function cachedPack(objects: readonly GitObject[], oids: readonly string[]): Buffer {
+  const key = oids.join(',');
+  const hit = PACK_CACHE.get(key);
+  if (hit !== undefined) return hit;
+  const pack = writePack(objects);
+  if (PACK_CACHE.size >= PACK_CACHE_MAX) {
+    const oldest = PACK_CACHE.keys().next().value;
+    if (oldest !== undefined) PACK_CACHE.delete(oldest);
+  }
+  PACK_CACHE.set(key, pack);
+  return pack;
 }
 
 /** POST git-upload-pack `command=fetch` (v2): sections + a sideband-framed pack. */
-function fetchV2(store: Store, repo: Parameters<Store['listRefs']>[0], body: Buffer): Buffer {
-  const command = readSection(body, 0);
-  const commandText = textLines(command.lines);
-  if (commandText[0] !== 'command=fetch') throw new Malformed('expected command=fetch');
-  const argsLines = readSection(body, command.after).lines;
+function fetchV2(store: Store, repo: Parameters<Store['listRefs']>[0], body: Buffer, argsStart: number): Buffer {
+  const argsLines = readSection(body, argsStart).lines;
   const args = parseFetchArgs(textLines(argsLines));
   for (const oid of [...args.wants, ...args.haves, ...args.shallow]) {
     if (!isObjectId(oid)) throw new Malformed(`not an object id: ${oid}`);
   }
   if (Number.isNaN(args.depth)) throw new Malformed('deepen is not a number');
 
-  const { objects, shallow, unshallow } = fetchSelection(store, repo, args);
-  const pack = writePack(objects);
+  const { objects, objectOids, shallow, unshallow } = fetchSelection(store, repo, args);
+  const pack = cachedPack(objects, objectOids);
 
-  const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), pktFlush()];
+  const parts: Buffer[] = [FETCH_ACK_PREFIX];
   if (shallow.length > 0 || unshallow.length > 0) {
     parts.push(pktLine('shallow-info\n'));
     for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
     for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-    parts.push(pktFlush());
+    parts.push(FLUSH_PACKET);
   }
-  parts.push(pktLine('packfile\n'));
+  parts.push(PACKFILE_MARKER);
   parts.push(...sidebandPack(pack));
-  parts.push(pktFlush());
+  parts.push(FLUSH_PACKET);
   return Buffer.concat(parts);
 }
 
@@ -474,10 +513,10 @@ function receivePack(store: Store, repo: Parameters<Store['listRefs']>[0], body:
     for (let offset = 0; offset < reportBytes.length; offset += SIDEBAND_MAX) {
       parts.push(sideBandFrame(1, reportBytes.subarray(offset, Math.min(reportBytes.length, offset + SIDEBAND_MAX))));
     }
-    parts.push(pktFlush());
+    parts.push(FLUSH_PACKET);
     return Buffer.concat(parts);
   }
-  return Buffer.concat([reportBytes, pktFlush()]);
+  return Buffer.concat([reportBytes, FLUSH_PACKET]);
 }
 
 // ------------------------------------------------------------ routing
@@ -539,10 +578,13 @@ export async function handleGit(
     }
     try {
       const body = await readBody(req);
-      const first = textLines(readSection(body, 0).lines)[0] ?? '';
+      // The command section is read once here, to route; ls-refs and fetch take
+      // its end offset and read only their arguments section, never the body twice.
+      const commandSection = readSection(body, 0);
+      const first = textLines(commandSection.lines)[0] ?? '';
       let out: Buffer;
-      if (first === 'command=ls-refs') out = lsRefs(store, repo, body);
-      else if (first === 'command=fetch') out = fetchV2(store, repo, body);
+      if (first === 'command=ls-refs') out = lsRefs(store, repo, body, commandSection.after);
+      else if (first === 'command=fetch') out = fetchV2(store, repo, body, commandSection.after);
       else throw new Malformed(`unsupported upload-pack command: ${JSON.stringify(first)}`);
       sendGit(res, 200, UPLOAD_RESULT_CT, out, requestId);
     } catch (err) {

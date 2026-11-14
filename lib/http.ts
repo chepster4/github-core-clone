@@ -30,8 +30,32 @@ export function sendPrebuilt(
 
 /** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
 export function pathOf(req: IncomingMessage): string {
+  const url = req.url ?? '/';
+  // Fast path for a plain printable-ASCII request target: cut at the query or
+  // fragment and return the path — exactly what `new URL(url, base).pathname`
+  // gives for such a target (the URL parser keeps %XX as-is and never decodes it).
+  // Anything the parser would normalize differently — protocol-relative `//`, dot
+  // segments, backslashes, spaces or control characters, non-ASCII — falls back
+  // to the parser, so routing never changes for any request.
+  if (
+    url.startsWith('/') &&
+    !url.startsWith('//') &&
+    !url.includes('/.') &&
+    !url.includes('\\') &&
+    !url.includes(' ') &&
+    !url.includes('\t') &&
+    !url.includes('\n') &&
+    !/[^\x20-\x7E]/.test(url)
+  ) {
+    let end = url.length;
+    const query = url.indexOf('?');
+    if (query !== -1 && query < end) end = query;
+    const fragment = url.indexOf('#');
+    if (fragment !== -1 && fragment < end) end = fragment;
+    return end === url.length ? url : url.slice(0, end);
+  }
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    return new URL(url, 'http://entry').pathname;
   } catch {
     return '/';
   }
