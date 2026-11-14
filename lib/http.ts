@@ -63,6 +63,9 @@ export function pathOf(req: IncomingMessage): string {
 
 /** Read a request body whole, as bytes (a Buffer is never a string until the caller decodes it). */
 export function readBody(req: IncomingMessage): Promise<Buffer> {
+  // The raw transport reads the body whole before dispatching: return it at once.
+  const pre = (req as unknown as { __body?: Buffer }).__body;
+  if (pre !== undefined) return Promise.resolve(pre);
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
     // Stream chunks already arrive as Buffers; copying each one again only doubles the work.
