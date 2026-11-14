@@ -3,11 +3,13 @@
 // (rest.ts), GraphQL v4 (graphql.ts) and MCP (mcp.ts). main.ts owns the lifecycle;
 // this file owns the server.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type net from 'node:net';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { executeGraphQL } from './lib/graphql.ts';
 import { handleGit } from './lib/gitproto.ts';
 import { parseJsonBody, pathOf, readBody, sendJson } from './lib/http.ts';
 import { handleMcp } from './lib/mcp.ts';
+import { createRawServer } from './lib/rawhttp.ts';
 import { handleRest } from './lib/rest.ts';
 import { Store } from './lib/store.ts';
 
@@ -34,11 +36,18 @@ export function isAuthorized(req: IncomingMessage): boolean {
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
+export function createApp(): net.Server {
   const store = new Store();
   let requestSeq = 0;
 
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  // The raw transport parses HTTP itself and hands the handler a RawReq/RawRes pair.
+  // The pair carries exactly the surface the handlers use (method, url, headers, a
+  // pre-read body; writeHead, end, headersSent), so the casts below are safe: the
+  // entry runs with --experimental-strip-types and nothing here touches a real
+  // IncomingMessage/ServerResponse method.
+  return createRawServer((rawReq, rawRes) => {
+    const req = rawReq as unknown as IncomingMessage;
+    const res = rawRes as unknown as ServerResponse;
     void (async () => {
       requestSeq += 1;
       const requestId = `req-${requestSeq}`;
